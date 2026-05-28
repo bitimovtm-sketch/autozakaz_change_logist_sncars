@@ -89,7 +89,7 @@ def get_active_tasks_for_deal(deal_id):
     try:
         result = b24("tasks.task.list", {
             "filter": {"CRM_ENTITY_TYPE": "DEAL", "CRM_ENTITY_ID": deal_id, "REAL_STATUS": [1, 2, 3]},
-            "select": ["ID", "STATUS"],
+            "select": ["ID", "STATUS", "TITLE"],
         })
         return result.get("tasks", [])
     except Exception as e:
@@ -217,7 +217,15 @@ def webhook():
 
         tasks = get_active_tasks_for_deal(deal_id)
         for task in tasks:
-            if update_task_members(int(task.get("id") or task.get("ID")), employee_id):
+            task_id = int(task.get("id") or task.get("ID"))
+            task_title = task.get("title") or task.get("TITLE") or ""
+
+            # Пропускаем задачи с этим текстом в названии
+            if "Не найдена сделка в воронке dongchedi" in task_title:
+                log.info("Задача %s пропущена (название: %s)", task_id, task_title)
+                continue
+
+            if update_task_members(task_id, employee_id):
                 total_tasks_ok += 1
 
     log.info("Готово. Сделок обновлено: %s/%s, задач обновлено: %s",
