@@ -88,7 +88,7 @@ def update_deal_employee(deal_id, user_id):
 def get_active_tasks_for_deal(deal_id):
     try:
         result = b24("tasks.task.list", {
-            "filter": {"CRM_ENTITY_TYPE": "DEAL", "CRM_ENTITY_ID": deal_id, "STATUS": [2, 3]},
+            "filter": {"CRM_ENTITY_TYPE": "DEAL", "CRM_ENTITY_ID": deal_id, "REAL_STATUS": [1, 2, 3]},
             "select": ["ID", "STATUS"],
         })
         return result.get("tasks", [])
