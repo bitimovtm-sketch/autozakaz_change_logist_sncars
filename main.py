@@ -77,8 +77,14 @@ def get_all_deals(stage_id, allowed_transit_ids):
 
 def update_deal_employee(deal_id, user_id):
     try:
-        b24("crm.deal.update", {"id": deal_id, "fields": {DEAL_EMPLOYEE_FIELD: user_id}})
-        log.info("Сделка %s: сотрудник → user %s", deal_id, user_id)
+        upd = b24("crm.deal.update", {"id": deal_id, "fields": {DEAL_EMPLOYEE_FIELD: user_id}})
+        log.info("Сделка %s: отправлено %s=%s, ответ update=%s", deal_id, DEAL_EMPLOYEE_FIELD, user_id, upd)
+
+        # Проверка: читаем поле обратно, чтобы убедиться что записалось
+        check = b24("crm.deal.get", {"id": deal_id})
+        actual = check.get(DEAL_EMPLOYEE_FIELD) if isinstance(check, dict) else None
+        log.info("Сделка %s: ПОСЛЕ записи поле %s = %s", deal_id, DEAL_EMPLOYEE_FIELD, actual)
+
         return True
     except Exception as e:
         log.error("Ошибка обновления сделки %s: %s", deal_id, e)
@@ -215,18 +221,20 @@ def webhook():
         if update_deal_employee(deal_id, employee_id):
             total_deals_ok += 1
 
-        tasks = get_active_tasks_for_deal(deal_id)
-        for task in tasks:
-            task_id = int(task.get("id") or task.get("ID"))
-            task_title = task.get("title") or task.get("TITLE") or ""
-
-            # Пропускаем задачи с этим текстом в названии
-            if "Не найдена сделка в воронке dongchedi" in task_title:
-                log.info("Задача %s пропущена (название: %s)", task_id, task_title)
-                continue
-
-            if update_task_members(task_id, employee_id):
-                total_tasks_ok += 1
+        # --- ОБРАБОТКА ЗАДАЧ ВРЕМЕННО ОТКЛЮЧЕНА (отладка поля сделки) ---
+        # tasks = get_active_tasks_for_deal(deal_id)
+        # for task in tasks:
+        #     task_id = int(task.get("id") or task.get("ID"))
+        #     task_title = task.get("title") or task.get("TITLE") or ""
+        #
+        #     # Пропускаем задачи с этим текстом в названии
+        #     if "Не найдена сделка в воронке dongchedi" in task_title:
+        #         log.info("Задача %s пропущена (название: %s)", task_id, task_title)
+        #         continue
+        #
+        #     if update_task_members(task_id, employee_id):
+        #         total_tasks_ok += 1
+        # --- КОНЕЦ ОТКЛЮЧЁННОГО БЛОКА ---
 
     log.info("Готово. Сделок обновлено: %s/%s, задач обновлено: %s",
              total_deals_ok, len(deals), total_tasks_ok)
