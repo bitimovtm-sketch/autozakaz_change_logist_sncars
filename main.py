@@ -210,14 +210,14 @@ def webhook():
     total_tasks_ok = 0
 
     for deal in deals:
-        deal_id = int(deal["id"])
+        deal_id = int(deal.get("ID") or deal.get("id"))
 
         if update_deal_employee(deal_id, employee_id):
             total_deals_ok += 1
 
         tasks = get_active_tasks_for_deal(deal_id)
         for task in tasks:
-            if update_task_members(int(task["id"]), employee_id):
+            if update_task_members(int(task.get("id") or task.get("ID")), employee_id):
                 total_tasks_ok += 1
 
     log.info("Готово. Сделок обновлено: %s/%s, задач обновлено: %s",
