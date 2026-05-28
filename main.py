@@ -194,7 +194,6 @@ def process_item(item_id):
         return
 
     total_deals_ok = 0
-    total_tasks_ok = 0
 
     for deal in deals:
         deal_id = int(deal.get("ID") or deal.get("id"))
@@ -202,21 +201,22 @@ def process_item(item_id):
         if update_deal_employee(deal_id, employee_id):
             total_deals_ok += 1
 
-        if PROCESS_TASKS:
-            tasks = get_active_tasks_for_deal(deal_id)
-            for task in tasks:
-                task_id = int(task.get("id") or task.get("ID"))
-                task_title = task.get("title") or task.get("TITLE") or ""
+        # --- ОБРАБОТКА ЗАДАЧ ОТКЛЮЧЕНА ---
+        # if PROCESS_TASKS:
+        #     tasks = get_active_tasks_for_deal(deal_id)
+        #     for task in tasks:
+        #         task_id = int(task.get("id") or task.get("ID"))
+        #         task_title = task.get("title") or task.get("TITLE") or ""
+        #
+        #         if "Не найдена сделка в воронке dongchedi" in task_title:
+        #             log.info("Задача %s пропущена (название: %s)", task_id, task_title)
+        #             continue
+        #
+        #         if update_task_members(task_id, employee_id):
+        #             total_tasks_ok += 1
+        # --- КОНЕЦ ОТКЛЮЧЁННОГО БЛОКА ---
 
-                if "Не найдена сделка в воронке dongchedi" in task_title:
-                    log.info("Задача %s пропущена (название: %s)", task_id, task_title)
-                    continue
-
-                if update_task_members(task_id, employee_id):
-                    total_tasks_ok += 1
-
-    log.info("=== Готово. Сделок обновлено: %s/%s, задач обновлено: %s ===",
-             total_deals_ok, len(deals), total_tasks_ok)
+    log.info("=== Готово. Сделок обновлено: %s/%s ===", total_deals_ok, len(deals))
 
 
 @app.route("/webhook", methods=["POST"])
