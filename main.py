@@ -16,6 +16,12 @@ DEAL_CATEGORY_ID     = int(os.environ["DEAL_CATEGORY_ID"])
 DEAL_EMPLOYEE_FIELD  = os.environ["DEAL_EMPLOYEE_FIELD"]
 DEAL_TRANSIT_FIELD   = os.environ["DEAL_TRANSIT_FIELD"]
 
+# Доп. поле: переносится из смарт-процесса в сделку по аналогии с сотрудником
+# В смарт-процессе: UF_CRM_34_1779182549 → ufCrm34_1779182549
+# В сделке:         UF_CRM_1759795520
+SMART_EXTRA_FIELD    = os.environ.get("SMART_EXTRA_FIELD", "ufCrm34_1779182549")
+DEAL_EXTRA_FIELD     = os.environ.get("DEAL_EXTRA_FIELD",  "UF_CRM_1759795520")
+
 # Обрабатывать ли задачи. По умолчанию ВКЛ. Чтобы отключить — задайте PROCESS_TASKS=0 в Railway.
 PROCESS_TASKS = os.environ.get("PROCESS_TASKS", "1") not in ("0", "false", "False", "")
 
@@ -79,10 +85,18 @@ def get_all_deals(stage_id, allowed_transit_ids):
     return deals
 
 
-def update_deal_employee(deal_id, user_id):
+def update_deal_employee(deal_id, user_id, extra_value=None):
+    """
+    Обновляет в сделке поле сотрудника и (если передано) доп. поле.
+    Оба поля пишутся одним запросом — это вдвое быстрее, чем двумя.
+    """
+    fields = {DEAL_EMPLOYEE_FIELD: user_id}
+    if extra_value is not None:
+        fields[DEAL_EXTRA_FIELD] = extra_value
+
     try:
-        b24("crm.deal.update", {"id": deal_id, "fields": {DEAL_EMPLOYEE_FIELD: user_id}})
-        log.info("Сделка %s: сотрудник → user %s", deal_id, user_id)
+        b24("crm.deal.update", {"id": deal_id, "fields": fields})
+        log.info("Сделка %s: сотрудник → user %s, доп.поле → %s", deal_id, user_id, extra_value)
         return True
     except Exception as e:
         log.error("Ошибка обновления сделки %s: %s", deal_id, e)
@@ -170,8 +184,10 @@ def process_item(item_id):
     employee_id_raw   = item.get(SMART_EMPLOYEE_FIELD)
     deal_stage_id     = item.get(SMART_STAGE_FIELD)
     smart_transit_raw = item.get("ufCrm34_1779184434")
+    extra_value       = item.get(SMART_EXTRA_FIELD)
 
-    log.info("Сотрудник=%s, Стадия=%s, Транзит=%s", employee_id_raw, deal_stage_id, smart_transit_raw)
+    log.info("Сотрудник=%s, Стадия=%s, Транзит=%s, Доп.поле=%s",
+             employee_id_raw, deal_stage_id, smart_transit_raw, extra_value)
 
     if not employee_id_raw:
         log.warning("Поле сотрудника пустое — выходим")
@@ -198,7 +214,7 @@ def process_item(item_id):
     for deal in deals:
         deal_id = int(deal.get("ID") or deal.get("id"))
 
-        if update_deal_employee(deal_id, employee_id):
+        if update_deal_employee(deal_id, employee_id, extra_value):
             total_deals_ok += 1
 
         # --- ОБРАБОТКА ЗАДАЧ ОТКЛЮЧЕНА ---
