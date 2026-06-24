@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import threading
 import requests
@@ -16,20 +17,18 @@ DEAL_CATEGORY_ID     = int(os.environ["DEAL_CATEGORY_ID"])
 DEAL_EMPLOYEE_FIELD  = os.environ["DEAL_EMPLOYEE_FIELD"]
 DEAL_TRANSIT_FIELD   = os.environ["DEAL_TRANSIT_FIELD"]
 
-# Доп. поле: переносится из смарт-процесса в сделку по аналогии с сотрудником
-# В смарт-процессе: UF_CRM_34_1779182549 → ufCrm34_1779182549
-# В сделке:         UF_CRM_1759795520
 SMART_EXTRA_FIELD    = os.environ.get("SMART_EXTRA_FIELD", "ufCrm34_1779182549")
 DEAL_EXTRA_FIELD     = os.environ.get("DEAL_EXTRA_FIELD",  "UF_CRM_1759795520")
 
-# Обрабатывать ли задачи. По умолчанию ВКЛ. Чтобы отключить — задайте PROCESS_TASKS=0 в Railway.
 PROCESS_TASKS = os.environ.get("PROCESS_TASKS", "1") not in ("0", "false", "False", "")
 
-# Маппинг "Вид транзита": ID в смарт-процессе → допустимые ID в сделке
 TRANSIT_MAP = {
-    1062: [982],       # Уссурийск → Уссурийск
-    1064: [990, 980],  # Уссурийск-МСК, Хоргос → Уссурийск-Москва, Хоргос
+    1062: [982],
+    1064: [990, 980],
 }
+
+# Пауза между батчами (сек). 0.6 сек = ~1.7 batch/сек, что укладывается в лимит 2 req/сек.
+BATCH_PAUSE = float(os.environ.get("BATCH_PAUSE", "0.6"))
 
 
 def b24(method, params):
@@ -40,6 +39,19 @@ def b24(method, params):
     if "error" in data:
         raise RuntimeError(f"Bitrix24 API error [{method}]: {data}")
     return data.get("result", data)
+
+
+def b24_batch(commands: dict):
+    """
+    Выполняет до 50 команд одним запросом через batch.
+    commands = {"cmd0": "crm.deal.update?id=1&fields[FOO]=bar", ...}
+    Возвращает словарь result или {} при ошибке.
+    """
+    url = f"{BITRIX_WEBHOOK_URL.rstrip('/')}/batch.json"
+    resp = requests.post(url, json={"halt": 0, "cmd": commands}, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("result", {})
 
 
 def get_smart_item(item_id):
@@ -55,7 +67,6 @@ def get_all_deals(stage_id, allowed_transit_ids):
     """
     Получить ВСЕ сделки на стадии с нужным видом транзита.
     Битрикс отдаёт максимум 50 за раз — обходим все страницы.
-    При 1000 сделках будет ~20 запросов.
     """
     deals = []
     start = 0
@@ -78,29 +89,57 @@ def get_all_deals(stage_id, allowed_transit_ids):
         log.info("Страница start=%s: получено %s, всего накоплено %s", start, len(batch), len(deals))
 
         if len(batch) < 50:
-            # Последняя страница — больше нет
             break
         start += 50
+        time.sleep(BATCH_PAUSE)
 
     return deals
 
 
-def update_deal_employee(deal_id, user_id, extra_value=None):
+def update_deals_batch(deals, employee_id, extra_value):
     """
-    Обновляет в сделке поле сотрудника и (если передано) доп. поле.
-    Оба поля пишутся одним запросом — это вдвое быстрее, чем двумя.
+    Обновляет поля во всех сделках через batch по 50 штук.
+    500 сделок = 10 запросов вместо 500.
     """
-    fields = {DEAL_EMPLOYEE_FIELD: user_id}
-    if extra_value is not None:
-        fields[DEAL_EXTRA_FIELD] = extra_value
+    total_ok = 0
+    chunks = [deals[i:i+50] for i in range(0, len(deals), 50)]
 
-    try:
-        b24("crm.deal.update", {"id": deal_id, "fields": fields})
-        log.info("Сделка %s: сотрудник → user %s, доп.поле → %s", deal_id, user_id, extra_value)
-        return True
-    except Exception as e:
-        log.error("Ошибка обновления сделки %s: %s", deal_id, e)
-        return False
+    for chunk_idx, chunk in enumerate(chunks):
+        commands = {}
+        for i, deal in enumerate(chunk):
+            deal_id = int(deal.get("ID") or deal.get("id"))
+            fields = {DEAL_EMPLOYEE_FIELD: employee_id}
+            if extra_value is not None:
+                fields[DEAL_EXTRA_FIELD] = extra_value
+
+            # Формируем строку запроса для batch
+            params = f"crm.deal.update?id={deal_id}"
+            for key, val in fields.items():
+                params += f"&fields[{key}]={val}"
+            commands[f"cmd{i}"] = params
+
+        try:
+            result = b24_batch(commands)
+            result_map = result.get("result", result) if isinstance(result, dict) else {}
+            errors    = result.get("result_error", {}) if isinstance(result, dict) else {}
+
+            ok_count  = len([v for v in result_map.values() if v])
+            err_count = len([v for v in errors.values() if v])
+            total_ok += ok_count
+            log.info(
+                "Батч %s/%s: %s сделок — обновлено %s, ошибок %s",
+                chunk_idx + 1, len(chunks), len(chunk), ok_count, err_count
+            )
+            if errors:
+                log.warning("Ошибки батча %s: %s", chunk_idx + 1, errors)
+        except Exception as e:
+            log.error("Ошибка батча %s: %s", chunk_idx + 1, e)
+
+        # Пауза между батчами чтобы не превысить rate limit
+        if chunk_idx < len(chunks) - 1:
+            time.sleep(BATCH_PAUSE)
+
+    return total_ok
 
 
 def get_active_tasks_for_deal(deal_id):
@@ -129,21 +168,8 @@ def update_task_members(task_id, user_id):
 
 
 def extract_item_id(payload):
-    """
-    Извлечь ID элемента смарт-процесса из payload.
-
-    Робот бизнес-процесса Битрикс24 присылает форму где ключи выглядят как:
-      document_id[0] = crm
-      document_id[1] = Bitrix\\Crm\\...\\Dynamic
-      document_id[2] = DYNAMIC_1090_12   ← нам нужен этот, число 12
-
-    Flask parses "document_id[2]" как ImmutableMultiDict с ключом "document_id[2]"
-    или иногда как вложенный dict document_id → {2: ...}
-    Проверяем оба варианта.
-    """
     log.info("Все ключи payload: %s", list(payload.keys()))
 
-    # Вариант А: ключ пришёл как строка "document_id[2]"
     doc = payload.get("document_id[2]")
     if doc:
         log.info("document_id[2] (вариант А): %s", doc)
@@ -151,7 +177,6 @@ def extract_item_id(payload):
         if len(parts) == 2 and parts[1].isdigit():
             return int(parts[1])
 
-    # Вариант Б: Flask распарсил как вложенный — ищем любой ключ содержащий document_id
     for key, val in payload.items():
         if "document_id" in key and "2" in key:
             log.info("document_id ключ '%s' = '%s'", key, val)
@@ -159,12 +184,10 @@ def extract_item_id(payload):
             if len(parts) == 2 and parts[1].isdigit():
                 return int(parts[1])
 
-    # Вариант В: стандартный исходящий вебхук
     raw = payload.get("data[FIELDS][ID]") or payload.get("data[FIELDS][id]") or payload.get("ID")
     if raw and str(raw).isdigit():
         return int(raw)
 
-    # Вариант Г: ID в строке запроса (?ID=12)
     raw = request.args.get("ID") or request.args.get("id")
     if raw and str(raw).isdigit():
         return int(raw)
@@ -209,28 +232,7 @@ def process_item(item_id):
         log.info("Сделок не найдено — выходим")
         return
 
-    total_deals_ok = 0
-
-    for deal in deals:
-        deal_id = int(deal.get("ID") or deal.get("id"))
-
-        if update_deal_employee(deal_id, employee_id, extra_value):
-            total_deals_ok += 1
-
-        # --- ОБРАБОТКА ЗАДАЧ ОТКЛЮЧЕНА ---
-        # if PROCESS_TASKS:
-        #     tasks = get_active_tasks_for_deal(deal_id)
-        #     for task in tasks:
-        #         task_id = int(task.get("id") or task.get("ID"))
-        #         task_title = task.get("title") or task.get("TITLE") or ""
-        #
-        #         if "Не найдена сделка в воронке dongchedi" in task_title:
-        #             log.info("Задача %s пропущена (название: %s)", task_id, task_title)
-        #             continue
-        #
-        #         if update_task_members(task_id, employee_id):
-        #             total_tasks_ok += 1
-        # --- КОНЕЦ ОТКЛЮЧЁННОГО БЛОКА ---
+    total_deals_ok = update_deals_batch(deals, employee_id, extra_value)
 
     log.info("=== Готово. Сделок обновлено: %s/%s ===", total_deals_ok, len(deals))
 
@@ -252,8 +254,6 @@ def webhook():
 
     log.info("ID смарт-процесса: %s — запускаю обработку в фоне", item_id)
 
-    # Запускаем тяжёлую работу в фоновом потоке и сразу отвечаем Битриксу.
-    # Так воркер не висит и не падает по таймауту даже на 1000+ сделок.
     threading.Thread(target=process_item, args=(item_id,), daemon=True).start()
 
     return jsonify({"status": "accepted", "item_id": item_id}), 200
