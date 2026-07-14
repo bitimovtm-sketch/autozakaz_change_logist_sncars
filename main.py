@@ -2,6 +2,8 @@ import os
 import time
 import logging
 import threading
+from urllib.parse import quote
+
 import requests
 from flask import Flask, request, jsonify
 
@@ -27,8 +29,13 @@ TRANSIT_MAP = {
     1064: [990, 980],
 }
 
-# Пауза между батчами (сек). 0.6 сек = ~1.7 batch/сек, что укладывается в лимит 2 req/сек.
-BATCH_PAUSE = float(os.environ.get("BATCH_PAUSE", "0.6"))
+# Размер батча. 20 вместо 50 — чтобы batch с crm.item.update укладывался
+# в лимит времени выполнения на стороне Битрикса (OPERATION_TIME_LIMIT).
+BATCH_SIZE  = int(os.environ.get("BATCH_SIZE", "20"))
+# Пауза между батчами (сек).
+BATCH_PAUSE = float(os.environ.get("BATCH_PAUSE", "1.0"))
+# Сколько раз повторять обновление сделок, которые не обновились.
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 
 
 def b24(method, params):
@@ -43,15 +50,32 @@ def b24(method, params):
 
 def b24_batch(commands: dict):
     """
-    Выполняет до 50 команд одним запросом через batch.
-    commands = {"cmd0": "crm.deal.update?id=1&fields[FOO]=bar", ...}
-    Возвращает словарь result или {} при ошибке.
+    Выполняет до 50 команд одним запросом через batch (halt=0 —
+    ошибки отдельных команд не останавливают остальные).
+    Возвращает (result_map, error_map).
     """
     url = f"{BITRIX_WEBHOOK_URL.rstrip('/')}/batch.json"
     resp = requests.post(url, json={"halt": 0, "cmd": commands}, timeout=60)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("result", {})
+    result = data.get("result", {})
+    if isinstance(result, dict):
+        return result.get("result", {}) or {}, result.get("result_error", {}) or {}
+    return {}, {}
+
+
+def build_update_cmd(deal_id, fields):
+    """
+    Строка команды batch для crm.item.update (entityTypeId=2 — сделки).
+    crm.item.update вместо crm.deal.update: легче по времени выполнения,
+    меньше шансов словить OPERATION_TIME_LIMIT в батче.
+    Значения ОБЯЗАТЕЛЬНО кодируем через quote() — иначе пробелы,
+    кириллица и спецсимволы ломают команду и сделка молча пропускается.
+    """
+    parts = [f"crm.item.update?entityTypeId=2&id={deal_id}"]
+    for key, val in fields.items():
+        parts.append(f"fields[{quote(str(key))}]={quote(str(val))}")
+    return "&".join(parts)
 
 
 def get_smart_item(item_id):
@@ -66,80 +90,113 @@ def get_smart_item(item_id):
 def get_all_deals(stage_id, allowed_transit_ids):
     """
     Получить ВСЕ сделки на стадии с нужным видом транзита.
-    Битрикс отдаёт максимум 50 за раз — обходим все страницы.
+    Пагинация по ID (order + filter >ID) вместо start — быстрее и надёжнее:
+    выборка не «съезжает», если сделки меняются во время обхода.
     """
     deals = []
-    start = 0
+    last_id = 0
     while True:
-        f = {"CATEGORY_ID": DEAL_CATEGORY_ID, "STAGE_ID": stage_id}
+        f = {"CATEGORY_ID": DEAL_CATEGORY_ID, "STAGE_ID": stage_id, ">ID": last_id}
         if allowed_transit_ids:
             f[DEAL_TRANSIT_FIELD] = allowed_transit_ids
         try:
             result = b24("crm.deal.list", {
+                "order":  {"ID": "ASC"},
                 "filter": f,
                 "select": ["ID", "TITLE"],
-                "start": start,
+                "start":  -1,  # отключает подсчёт total — заметно быстрее
             })
         except Exception as e:
-            log.error("Ошибка получения сделок (start=%s): %s", start, e)
+            log.error("Ошибка получения сделок (last_id=%s): %s", last_id, e)
             break
 
         batch = result if isinstance(result, list) else []
+        if not batch:
+            break
+
         deals.extend(batch)
-        log.info("Страница start=%s: получено %s, всего накоплено %s", start, len(batch), len(deals))
+        last_id = max(int(d["ID"]) for d in batch)
+        log.info("Страница >ID=%s: получено %s, всего накоплено %s",
+                 last_id, len(batch), len(deals))
 
         if len(batch) < 50:
             break
-        start += 50
-        time.sleep(BATCH_PAUSE)
+        time.sleep(0.5)
 
     return deals
 
 
-def update_deals_batch(deals, employee_id, extra_value):
+def update_deals_batch(deal_ids, employee_id, extra_value):
     """
-    Обновляет поля во всех сделках через batch по 50 штук.
-    500 сделок = 10 запросов вместо 500.
+    Обновляет сделки батчами по BATCH_SIZE через crm.item.update.
+    Возвращает (список успешных ID, список проваленных ID).
     """
-    total_ok = 0
-    chunks = [deals[i:i+50] for i in range(0, len(deals), 50)]
+    fields = {DEAL_EMPLOYEE_FIELD: employee_id}
+    if extra_value is not None:
+        fields[DEAL_EXTRA_FIELD] = extra_value
+
+    ok_ids, failed_ids = [], []
+    chunks = [deal_ids[i:i + BATCH_SIZE] for i in range(0, len(deal_ids), BATCH_SIZE)]
 
     for chunk_idx, chunk in enumerate(chunks):
-        commands = {}
-        for i, deal in enumerate(chunk):
-            deal_id = int(deal.get("ID") or deal.get("id"))
-            fields = {DEAL_EMPLOYEE_FIELD: employee_id}
-            if extra_value is not None:
-                fields[DEAL_EXTRA_FIELD] = extra_value
-
-            # Формируем строку запроса для batch
-            params = f"crm.deal.update?id={deal_id}"
-            for key, val in fields.items():
-                params += f"&fields[{key}]={val}"
-            commands[f"cmd{i}"] = params
+        commands = {f"d{deal_id}": build_update_cmd(deal_id, fields) for deal_id in chunk}
 
         try:
-            result = b24_batch(commands)
-            result_map = result.get("result", result) if isinstance(result, dict) else {}
-            errors    = result.get("result_error", {}) if isinstance(result, dict) else {}
-
-            ok_count  = len([v for v in result_map.values() if v])
-            err_count = len([v for v in errors.values() if v])
-            total_ok += ok_count
-            log.info(
-                "Батч %s/%s: %s сделок — обновлено %s, ошибок %s",
-                chunk_idx + 1, len(chunks), len(chunk), ok_count, err_count
-            )
-            if errors:
-                log.warning("Ошибки батча %s: %s", chunk_idx + 1, errors)
+            result_map, error_map = b24_batch(commands)
         except Exception as e:
-            log.error("Ошибка батча %s: %s", chunk_idx + 1, e)
+            log.error("Батч %s/%s упал целиком: %s — все %s сделок в повтор",
+                      chunk_idx + 1, len(chunks), e, len(chunk))
+            failed_ids.extend(chunk)
+            time.sleep(BATCH_PAUSE * 2)
+            continue
 
-        # Пауза между батчами чтобы не превысить rate limit
+        for deal_id in chunk:
+            key = f"d{deal_id}"
+            if key in error_map and error_map[key]:
+                failed_ids.append(deal_id)
+                log.warning("Сделка %s: ошибка %s", deal_id, error_map[key])
+            elif key in result_map:
+                ok_ids.append(deal_id)
+            else:
+                # Команда не вернула ни результат, ни ошибку — считаем проваленной
+                failed_ids.append(deal_id)
+                log.warning("Сделка %s: нет ответа в батче", deal_id)
+
+        log.info("Батч %s/%s: успешно %s, ошибок %s",
+                 chunk_idx + 1, len(chunks),
+                 len([d for d in chunk if d in ok_ids]),
+                 len([d for d in chunk if d in failed_ids]))
+
         if chunk_idx < len(chunks) - 1:
             time.sleep(BATCH_PAUSE)
 
-    return total_ok
+    return ok_ids, failed_ids
+
+
+def update_deals_with_retries(deal_ids, employee_id, extra_value):
+    """
+    Обновляет все сделки; проваленные повторяет до MAX_RETRIES раз
+    с нарастающей паузой. Возвращает (всего успешных, оставшиеся проваленные).
+    """
+    total_ok = 0
+    pending = list(deal_ids)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        if not pending:
+            break
+        if attempt > 1:
+            pause = BATCH_PAUSE * (2 ** (attempt - 1))
+            log.info("Повтор №%s для %s сделок через %.1f сек", attempt, len(pending), pause)
+            time.sleep(pause)
+
+        ok_ids, failed_ids = update_deals_batch(pending, employee_id, extra_value)
+        total_ok += len(ok_ids)
+        pending = failed_ids
+
+    if pending:
+        log.error("НЕ ОБНОВЛЕНЫ после %s попыток: %s", MAX_RETRIES, pending)
+
+    return total_ok, pending
 
 
 def get_active_tasks_for_deal(deal_id):
@@ -232,9 +289,12 @@ def process_item(item_id):
         log.info("Сделок не найдено — выходим")
         return
 
-    total_deals_ok = update_deals_batch(deals, employee_id, extra_value)
+    deal_ids = [int(d.get("ID") or d.get("id")) for d in deals]
 
-    log.info("=== Готово. Сделок обновлено: %s/%s ===", total_deals_ok, len(deals))
+    total_ok, failed = update_deals_with_retries(deal_ids, employee_id, extra_value)
+
+    log.info("=== Готово. Сделок обновлено: %s/%s. Провалено: %s ===",
+             total_ok, len(deal_ids), failed or "нет")
 
 
 @app.route("/webhook", methods=["POST"])
